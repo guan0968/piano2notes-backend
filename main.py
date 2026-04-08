@@ -1,49 +1,26 @@
 """
 Piano2Notes 後端 API
-使用 Spotify Basic Pitch 將音訊轉換為 MIDI / 音符
-
-安裝依賴：
-  pip install fastapi uvicorn python-multipart basic-pitch mido
-
-啟動：
-  uvicorn main:app --reload --port 8000
-
-部署到 Railway：
-  1. 將此資料夾推上 GitHub
-  2. 在 Railway 建立新專案 → 連接 GitHub repo
-  3. Railway 自動偵測 Procfile 並部署
+使用 librosa 做音高偵測（不需要 tensorflow）
 """
 
 import io
 import base64
 import tempfile
 import os
-from pathlib import Path
+import struct
 
+import numpy as np
+import librosa
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-# Basic Pitch (Spotify)
-from basic_pitch.inference import predict
-from basic_pitch import ICASSP_2022_MODEL_PATH
-
-# MIDI 處理
-import mido
-
 app = FastAPI(title="Piano2Notes API", version="1.0.0")
 
-# 允許前端跨域請求（把你的 Vercel 網址加進去）
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "http://127.0.0.1:5500",
-        "https://*.vercel.app",
-        # 加入你的正式網域，例如：
-        # "https://piano2notes.tw",
-    ],
+    allow_origins=["*"],  # 部署後可改成你的 Vercel 網址
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -51,55 +28,136 @@ app.add_middleware(
 
 
 # ────────────────────────────────────────────
-#  工具函式
+#  音高偵測（librosa）
 # ────────────────────────────────────────────
 
-def midi_to_base64(midi_path: str) -> str:
-    """將 MIDI 檔案轉為 base64 字串回傳給前端"""
-    with open(midi_path, "rb") as f:
-        return base64.b64encode(f.read()).decode("utf-8")
+def hz_to_midi(hz):
+    """頻率轉 MIDI 音符編號"""
+    if hz <= 0:
+        return None
+    midi = 69 + 12 * np.log2(hz / 440.0)
+    return int(round(midi))
 
 
-def extract_notes_from_midi(midi_path: str) -> list[dict]:
+def detect_notes(audio_path: str) -> list[dict]:
     """
-    從 MIDI 檔案解析音符清單
-    回傳格式: [{ pitch, start_time, end_time, velocity }, ...]
+    使用 librosa 偵測音符
+    回傳: [{ pitch, start_time, end_time, velocity }, ...]
     """
-    mid = mido.MidiFile(midi_path)
+    # 載入音訊
+    y, sr = librosa.load(audio_path, sr=22050, mono=True)
+
+    # 使用 pyin 演算法偵測音高（適合旋律）
+    f0, voiced_flag, voiced_prob = librosa.pyin(
+        y,
+        fmin=librosa.note_to_hz('C2'),
+        fmax=librosa.note_to_hz('C7'),
+        sr=sr,
+        frame_length=2048,
+    )
+
+    # 計算每個 frame 的時間
+    hop_length = 512
+    times = librosa.times_like(f0, sr=sr, hop_length=hop_length)
+
+    # 將連續相同音高的 frame 合併成音符
     notes = []
-    tempo = 500000  # 預設 120 BPM
-    ticks_per_beat = mid.ticks_per_beat
+    current_note = None
 
-    for track in mid.tracks:
-        current_time = 0
-        active_notes = {}
+    for i, (t, freq, voiced) in enumerate(zip(times, f0, voiced_flag)):
+        if voiced and freq is not None and not np.isnan(freq):
+            midi = hz_to_midi(freq)
+            if midi is None:
+                continue
 
-        for msg in track:
-            current_time += msg.time
-            time_sec = mido.tick2second(current_time, ticks_per_beat, tempo)
-
-            if msg.type == "set_tempo":
-                tempo = msg.tempo
-
-            elif msg.type == "note_on" and msg.velocity > 0:
-                active_notes[msg.note] = {
-                    "pitch": msg.note,
-                    "start_time": round(time_sec, 3),
-                    "velocity": msg.velocity,
+            if current_note is None:
+                current_note = {
+                    "pitch": midi,
+                    "start_time": round(float(t), 3),
+                    "velocity": 80,
                 }
+            elif abs(midi - current_note["pitch"]) > 1:
+                # 音高改變，結束目前音符
+                current_note["end_time"] = round(float(t), 3)
+                current_note["duration"] = round(
+                    current_note["end_time"] - current_note["start_time"], 3
+                )
+                if current_note["duration"] > 0.05:
+                    notes.append(current_note)
+                current_note = {
+                    "pitch": midi,
+                    "start_time": round(float(t), 3),
+                    "velocity": 80,
+                }
+        else:
+            if current_note is not None:
+                current_note["end_time"] = round(float(t), 3)
+                current_note["duration"] = round(
+                    current_note["end_time"] - current_note["start_time"], 3
+                )
+                if current_note["duration"] > 0.05:
+                    notes.append(current_note)
+                current_note = None
 
-            elif msg.type in ("note_off",) or (
-                msg.type == "note_on" and msg.velocity == 0
-            ):
-                if msg.note in active_notes:
-                    note = active_notes.pop(msg.note)
-                    note["end_time"] = round(time_sec, 3)
-                    note["duration"] = round(time_sec - note["start_time"], 3)
-                    notes.append(note)
-
-    # 依開始時間排序
-    notes.sort(key=lambda n: n["start_time"])
     return notes
+
+
+# ────────────────────────────────────────────
+#  MIDI 生成（純 Python，不需要額外套件）
+# ────────────────────────────────────────────
+
+def notes_to_midi_bytes(notes: list[dict], bpm: int = 120) -> bytes:
+    """將音符清單轉為 MIDI 檔案的 bytes"""
+    ticks_per_beat = 480
+    tempo = int(60_000_000 / bpm)  # microseconds per beat
+
+    def var_len(value):
+        result = []
+        result.append(value & 0x7F)
+        value >>= 7
+        while value:
+            result.append((value & 0x7F) | 0x80)
+            value >>= 7
+        return bytes(reversed(result))
+
+    def ms_to_ticks(seconds):
+        return int(seconds * bpm * ticks_per_beat / 60)
+
+    # Header chunk
+    header = struct.pack('>4sHHHH', b'MThd', 6, 0, 1, ticks_per_beat)
+
+    # Track events
+    events = []
+    # Tempo event
+    events.append((0, bytes([0xFF, 0x51, 0x03,
+                              (tempo >> 16) & 0xFF,
+                              (tempo >> 8) & 0xFF,
+                              tempo & 0xFF])))
+
+    for note in notes:
+        on_tick = ms_to_ticks(note["start_time"])
+        off_tick = ms_to_ticks(note["end_time"])
+        pitch = max(0, min(127, note["pitch"]))
+        vel = note.get("velocity", 80)
+        events.append((on_tick, bytes([0x90, pitch, vel])))
+        events.append((off_tick, bytes([0x80, pitch, 0])))
+
+    # Sort by tick, convert to delta times
+    events.sort(key=lambda e: e[0])
+    track_data = b''
+    last_tick = 0
+    for tick, msg in events:
+        delta = tick - last_tick
+        last_tick = tick
+        track_data += var_len(delta) + msg
+
+    # End of track
+    track_data += b'\x00\xFF\x2F\x00'
+
+    # Track chunk
+    track = struct.pack('>4sI', b'MTrk', len(track_data)) + track_data
+
+    return header + track
 
 
 # ────────────────────────────────────────────
@@ -118,80 +176,47 @@ def health():
 
 @app.post("/transcribe")
 async def transcribe_audio(audio: UploadFile = File(...)):
-    """
-    接收音訊檔案，使用 Basic Pitch 轉譜
-    回傳：音符清單 + MIDI base64
-    """
-    # 驗證檔案類型
-    allowed_types = {
-        "audio/mpeg", "audio/wav", "audio/x-wav",
-        "audio/flac", "audio/mp4", "audio/m4a",
-        "audio/ogg", "audio/webm",
+    suffix_map = {
+        "audio/mpeg": ".mp3", "audio/wav": ".wav",
+        "audio/x-wav": ".wav", "audio/flac": ".flac",
+        "audio/mp4": ".m4a", "audio/webm": ".webm",
+        "audio/ogg": ".ogg",
     }
-    if audio.content_type and audio.content_type not in allowed_types:
-        raise HTTPException(status_code=400, detail=f"不支援的音訊格式：{audio.content_type}")
+    suffix = suffix_map.get(audio.content_type, ".mp3")
 
-    # 儲存到暫存檔
-    suffix = Path(audio.filename or "audio.mp3").suffix or ".mp3"
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
         content = await audio.read()
         tmp.write(content)
         tmp_path = tmp.name
 
     try:
-        # ── Basic Pitch 轉譜 ──
-        # model_output: 原始模型輸出
-        # midi_data:    pretty_midi 物件
-        # note_events:  [(start, end, pitch, amplitude, pitch_bend)]
-        model_output, midi_data, note_events = predict(
-            tmp_path,
-            ICASSP_2022_MODEL_PATH,
-            # 可調整參數：
-            onset_threshold=0.5,      # 音符起始偵測靈敏度 (0–1)
-            frame_threshold=0.3,      # 音框偵測靈敏度
-            minimum_note_length=58,   # 最短音符（毫秒）
-            minimum_frequency=None,   # 最低頻率 (Hz)，None = 不限
-            maximum_frequency=None,   # 最高頻率 (Hz)，None = 不限
-            multiple_pitch_bends=False,
-            melodia_trick=True,       # 改善旋律追蹤
-        )
+        notes = detect_notes(tmp_path)
 
-        # 將 pretty_midi 輸出存為 MIDI 檔
-        midi_out_path = tmp_path.replace(suffix, "_out.mid")
-        midi_data.write(midi_out_path)
+        # 產生 MIDI
+        if notes:
+            midi_bytes = notes_to_midi_bytes(notes)
+            midi_b64 = base64.b64encode(midi_bytes).decode("utf-8")
+        else:
+            midi_b64 = None
 
-        # 轉為 base64 回傳
-        midi_b64 = midi_to_base64(midi_out_path)
-
-        # 整理音符清單（前端顯示用）
-        notes = []
-        for start, end, pitch, amplitude, _ in note_events:
-            notes.append({
-                "pitch": int(pitch),
-                "start_time": round(float(start), 3),
-                "end_time": round(float(end), 3),
-                "duration": round(float(end - start), 3),
-                "velocity": int(amplitude * 127),
-            })
+        duration = notes[-1]["end_time"] if notes else 0
 
         return JSONResponse({
             "success": True,
             "note_count": len(notes),
             "notes": notes,
             "midi_base64": midi_b64,
-            "duration": round(midi_data.get_end_time(), 2),
+            "duration": duration,
         })
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"轉譜失敗：{str(e)}")
 
     finally:
-        # 清理暫存檔
-        for path in [tmp_path, tmp_path.replace(suffix, "_out.mid")]:
-            try:
-                os.unlink(path)
-            except FileNotFoundError:
-                pass
+        try:
+            os.unlink(tmp_path)
+        except FileNotFoundError:
+            pass
 
 
 class YoutubeRequest(BaseModel):
@@ -200,58 +225,32 @@ class YoutubeRequest(BaseModel):
 
 @app.post("/transcribe-youtube")
 async def transcribe_youtube(req: YoutubeRequest):
-    """
-    接收 YouTube URL，使用 yt-dlp 下載音訊後轉譜
-    需要額外安裝：pip install yt-dlp
-    """
     try:
-        import yt_dlp  # noqa
+        import yt_dlp
     except ImportError:
-        raise HTTPException(
-            status_code=501,
-            detail="yt-dlp 未安裝。請執行：pip install yt-dlp",
-        )
+        raise HTTPException(status_code=501, detail="yt-dlp 未安裝")
 
     with tempfile.TemporaryDirectory() as tmpdir:
         out_path = os.path.join(tmpdir, "audio")
-
         ydl_opts = {
             "format": "bestaudio/best",
             "outtmpl": out_path,
-            "postprocessors": [{
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": "mp3",
-            }],
+            "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3"}],
             "quiet": True,
         }
-
         try:
-            import yt_dlp
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 ydl.download([req.url])
         except Exception as e:
-            raise HTTPException(status_code=400, detail=f"無法下載影片：{str(e)}")
+            raise HTTPException(status_code=400, detail=f"下載失敗：{str(e)}")
 
         mp3_path = out_path + ".mp3"
         if not os.path.exists(mp3_path):
             raise HTTPException(status_code=500, detail="音訊下載失敗")
 
-        # 複用上面的轉譜邏輯
-        model_output, midi_data, note_events = predict(mp3_path, ICASSP_2022_MODEL_PATH)
-
-        midi_out = mp3_path.replace(".mp3", ".mid")
-        midi_data.write(midi_out)
-        midi_b64 = midi_to_base64(midi_out)
-
-        notes = [
-            {
-                "pitch": int(p),
-                "start_time": round(float(s), 3),
-                "end_time": round(float(e), 3),
-                "velocity": int(a * 127),
-            }
-            for s, e, p, a, _ in note_events
-        ]
+        notes = detect_notes(mp3_path)
+        midi_bytes = notes_to_midi_bytes(notes) if notes else b''
+        midi_b64 = base64.b64encode(midi_bytes).decode("utf-8") if notes else None
 
         return JSONResponse({
             "success": True,
@@ -261,9 +260,6 @@ async def transcribe_youtube(req: YoutubeRequest):
         })
 
 
-# ────────────────────────────────────────────
-#  本地開發入口
-# ────────────────────────────────────────────
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
