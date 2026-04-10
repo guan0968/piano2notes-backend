@@ -11,20 +11,40 @@ import struct
 
 import numpy as np
 import librosa
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
 
 app = FastAPI(title="Piano2Notes API", version="1.0.0")
 
+# CORS 設定：允許所有來源
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # 部署後可改成你的 Vercel 網址
-    allow_credentials=True,
+    allow_origins=["*"],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["*"],
 )
+
+# 額外手動加 CORS header（雙重保險）
+@app.middleware("http")
+async def add_cors_header(request: Request, call_next):
+    if request.method == "OPTIONS":
+        return Response(
+            status_code=200,
+            headers={
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+                "Access-Control-Allow-Headers": "*",
+            },
+        )
+    response = await call_next(request)
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = "*"
+    return response
 
 
 # ────────────────────────────────────────────
@@ -32,7 +52,6 @@ app.add_middleware(
 # ────────────────────────────────────────────
 
 def hz_to_midi(hz):
-    """頻率轉 MIDI 音符編號"""
     if hz <= 0:
         return None
     midi = 69 + 12 * np.log2(hz / 440.0)
@@ -40,14 +59,8 @@ def hz_to_midi(hz):
 
 
 def detect_notes(audio_path: str) -> list[dict]:
-    """
-    使用 librosa 偵測音符
-    回傳: [{ pitch, start_time, end_time, velocity }, ...]
-    """
-    # 載入音訊
     y, sr = librosa.load(audio_path, sr=22050, mono=True)
 
-    # 使用 pyin 演算法偵測音高（適合旋律）
     f0, voiced_flag, voiced_prob = librosa.pyin(
         y,
         fmin=librosa.note_to_hz('C2'),
@@ -56,11 +69,9 @@ def detect_notes(audio_path: str) -> list[dict]:
         frame_length=2048,
     )
 
-    # 計算每個 frame 的時間
     hop_length = 512
     times = librosa.times_like(f0, sr=sr, hop_length=hop_length)
 
-    # 將連續相同音高的 frame 合併成音符
     notes = []
     current_note = None
 
@@ -69,7 +80,6 @@ def detect_notes(audio_path: str) -> list[dict]:
             midi = hz_to_midi(freq)
             if midi is None:
                 continue
-
             if current_note is None:
                 current_note = {
                     "pitch": midi,
@@ -77,7 +87,6 @@ def detect_notes(audio_path: str) -> list[dict]:
                     "velocity": 80,
                 }
             elif abs(midi - current_note["pitch"]) > 1:
-                # 音高改變，結束目前音符
                 current_note["end_time"] = round(float(t), 3)
                 current_note["duration"] = round(
                     current_note["end_time"] - current_note["start_time"], 3
@@ -103,13 +112,12 @@ def detect_notes(audio_path: str) -> list[dict]:
 
 
 # ────────────────────────────────────────────
-#  MIDI 生成（純 Python，不需要額外套件）
+#  MIDI 生成
 # ────────────────────────────────────────────
 
 def notes_to_midi_bytes(notes: list[dict], bpm: int = 120) -> bytes:
-    """將音符清單轉為 MIDI 檔案的 bytes"""
     ticks_per_beat = 480
-    tempo = int(60_000_000 / bpm)  # microseconds per beat
+    tempo = int(60_000_000 / bpm)
 
     def var_len(value):
         result = []
@@ -123,12 +131,9 @@ def notes_to_midi_bytes(notes: list[dict], bpm: int = 120) -> bytes:
     def ms_to_ticks(seconds):
         return int(seconds * bpm * ticks_per_beat / 60)
 
-    # Header chunk
     header = struct.pack('>4sHHHH', b'MThd', 6, 0, 1, ticks_per_beat)
 
-    # Track events
     events = []
-    # Tempo event
     events.append((0, bytes([0xFF, 0x51, 0x03,
                               (tempo >> 16) & 0xFF,
                               (tempo >> 8) & 0xFF,
@@ -136,13 +141,12 @@ def notes_to_midi_bytes(notes: list[dict], bpm: int = 120) -> bytes:
 
     for note in notes:
         on_tick = ms_to_ticks(note["start_time"])
-        off_tick = ms_to_ticks(note["end_time"])
+        off_tick = ms_to_ticks(note.get("end_time", note["start_time"] + 0.5))
         pitch = max(0, min(127, note["pitch"]))
         vel = note.get("velocity", 80)
         events.append((on_tick, bytes([0x90, pitch, vel])))
         events.append((off_tick, bytes([0x80, pitch, 0])))
 
-    # Sort by tick, convert to delta times
     events.sort(key=lambda e: e[0])
     track_data = b''
     last_tick = 0
@@ -151,12 +155,8 @@ def notes_to_midi_bytes(notes: list[dict], bpm: int = 120) -> bytes:
         last_tick = tick
         track_data += var_len(delta) + msg
 
-    # End of track
     track_data += b'\x00\xFF\x2F\x00'
-
-    # Track chunk
     track = struct.pack('>4sI', b'MTrk', len(track_data)) + track_data
-
     return header + track
 
 
@@ -173,18 +173,6 @@ def root():
 def health():
     return {"status": "healthy"}
 
-from fastapi import Response
-from fastapi.responses import JSONResponse
-
-@app.options("/transcribe")
-async def options_transcribe():
-    return Response(
-        headers={
-            "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Methods": "POST, OPTIONS",
-            "Access-Control-Allow-Headers": "*",
-        }
-    )
 
 @app.post("/transcribe")
 async def transcribe_audio(audio: UploadFile = File(...)):
@@ -204,22 +192,23 @@ async def transcribe_audio(audio: UploadFile = File(...)):
     try:
         notes = detect_notes(tmp_path)
 
-        # 產生 MIDI
+        midi_b64 = None
         if notes:
             midi_bytes = notes_to_midi_bytes(notes)
             midi_b64 = base64.b64encode(midi_bytes).decode("utf-8")
-        else:
-            midi_b64 = None
 
-        duration = notes[-1]["end_time"] if notes else 0
+        duration = notes[-1].get("end_time", 0) if notes else 0
 
-        return JSONResponse({
-            "success": True,
-            "note_count": len(notes),
-            "notes": notes,
-            "midi_base64": midi_b64,
-            "duration": duration,
-        })
+        return JSONResponse(
+            content={
+                "success": True,
+                "note_count": len(notes),
+                "notes": notes,
+                "midi_base64": midi_b64,
+                "duration": duration,
+            },
+            headers={"Access-Control-Allow-Origin": "*"},
+        )
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"轉譜失敗：{str(e)}")
@@ -261,15 +250,20 @@ async def transcribe_youtube(req: YoutubeRequest):
             raise HTTPException(status_code=500, detail="音訊下載失敗")
 
         notes = detect_notes(mp3_path)
-        midi_bytes = notes_to_midi_bytes(notes) if notes else b''
-        midi_b64 = base64.b64encode(midi_bytes).decode("utf-8") if notes else None
+        midi_b64 = None
+        if notes:
+            midi_bytes = notes_to_midi_bytes(notes)
+            midi_b64 = base64.b64encode(midi_bytes).decode("utf-8")
 
-        return JSONResponse({
-            "success": True,
-            "note_count": len(notes),
-            "notes": notes,
-            "midi_base64": midi_b64,
-        })
+        return JSONResponse(
+            content={
+                "success": True,
+                "note_count": len(notes),
+                "notes": notes,
+                "midi_base64": midi_b64,
+            },
+            headers={"Access-Control-Allow-Origin": "*"},
+        )
 
 
 if __name__ == "__main__":
