@@ -173,6 +173,18 @@ def root():
 def health():
     return {"status": "healthy"}
 
+from fastapi import Response
+from fastapi.responses import JSONResponse
+
+@app.options("/transcribe")
+async def options_transcribe():
+    return Response(
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "POST, OPTIONS",
+            "Access-Control-Allow-Headers": "*",
+        }
+    )
 
 @app.post("/transcribe")
 async def transcribe_audio(audio: UploadFile = File(...)):
