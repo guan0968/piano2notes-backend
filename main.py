@@ -262,6 +262,11 @@ async def transcribe_audio(audio: UploadFile = File(...)):
     wav_path = tmp_path + ".wav"
 
     try:
+        # 先測試 ffmpeg 是否可用
+        ffmpeg_check = subprocess.run(["ffmpeg", "-version"], capture_output=True)
+        if ffmpeg_check.returncode != 0:
+            raise RuntimeError("ffmpeg 不可用")
+
         convert_to_wav(tmp_path, wav_path)
         notes = detect_notes(wav_path)
 
@@ -282,7 +287,10 @@ async def transcribe_audio(audio: UploadFile = File(...)):
         )
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"轉譜失敗：{str(e)}")
+        import traceback
+        err_detail = traceback.format_exc()
+        print(f"ERROR: {err_detail}")
+        raise HTTPException(status_code=500, detail=f"轉譜失敗：{str(e)} | {err_detail[:500]}")
 
     finally:
         for p in [tmp_path, wav_path]:
